@@ -65,23 +65,69 @@ class OptiStockApi {
       throw const SessionExpiredException();
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      final detail =
-          _tryDecode(utf8.decode(response.bodyBytes))?['title'] as String?;
-      throw ApiException(
-        detail ?? 'A operação falhou (${response.statusCode}).',
-      );
+      throw ApiException(_errorMessage(response));
     }
     return response.body.isEmpty
         ? {}
         : jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
   }
 
-  Future<Map<String, dynamic>> login(String email, String password) async {
-    final response = await _client.post(
-      _uri('auth/login'),
+  Future<Map<String, dynamic>> put(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final response = await _client.put(
+      _uri(path),
       headers: _headers,
-      body: jsonEncode({'email': email, 'password': password}),
-    ).timeout(const Duration(seconds: 15));
+      body: jsonEncode(body),
+    );
+    if (response.statusCode == 401) {
+      token = null;
+      await onUnauthorized?.call();
+      throw const SessionExpiredException();
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300)
+      throw ApiException(_errorMessage(response));
+    return response.body.isEmpty
+        ? {}
+        : jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+  }
+
+  Future<void> delete(String path) async {
+    final response = await _client.delete(_uri(path), headers: _headers);
+    if (response.statusCode == 401) {
+      token = null;
+      await onUnauthorized?.call();
+      throw const SessionExpiredException();
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300)
+      throw ApiException(_errorMessage(response));
+  }
+
+  String _errorMessage(http.Response response) {
+    final payload = _tryDecode(utf8.decode(response.bodyBytes));
+    final messages = <String>[];
+    final title = payload?['title'];
+    if (title is String && title.isNotEmpty) messages.add(title);
+    final errors = payload?['errors'];
+    if (errors is Map<String, dynamic>) {
+      for (final value in errors.values) {
+        if (value is List) messages.addAll(value.whereType<String>());
+      }
+    }
+    return messages.isNotEmpty
+        ? messages.toSet().join(' ')
+        : 'Operacao falhou (${response.statusCode}).';
+  }
+
+  Future<Map<String, dynamic>> login(String email, String password) async {
+    final response = await _client
+        .post(
+          _uri('auth/login'),
+          headers: _headers,
+          body: jsonEncode({'email': email, 'password': password}),
+        )
+        .timeout(const Duration(seconds: 15));
     if (response.statusCode != 200)
       throw ApiException('E-mail ou senha inválidos.');
     return jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
@@ -726,17 +772,18 @@ class HomeScreen extends StatelessWidget {
               Icons.inventory_2_outlined,
               () => onSelect(1),
             ),
-            _moduleTile(
-              context,
-              'Gerência',
-              Icons.query_stats_outlined,
-              () => Navigator.push(
+            if (context.read<AuthState>().roles.contains('Administrador'))
+              _moduleTile(
                 context,
-                MaterialPageRoute<void>(
-                  builder: (_) => const DashboardScreen(),
+                'Gerência',
+                Icons.query_stats_outlined,
+                () => Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => const DashboardScreen(),
+                  ),
                 ),
               ),
-            ),
             if (context.read<AuthState>().roles.contains('Administrador'))
               _moduleTile(
                 context,
@@ -756,6 +803,18 @@ class HomeScreen extends StatelessWidget {
                       ),
                     );
                 },
+              ),
+            if (context.read<AuthState>().roles.contains('Administrador'))
+              _moduleTile(
+                context,
+                'Usuarios',
+                Icons.manage_accounts_outlined,
+                () => Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => const UserManagementScreen(),
+                  ),
+                ),
               ),
             _moduleTile(
               context,
@@ -1710,6 +1769,423 @@ class ProfileScreen extends StatelessWidget {
       ),
     ),
   );
+}
+
+class UserManagementScreen extends StatefulWidget {
+  const UserManagementScreen({super.key});
+  @override
+  State<UserManagementScreen> createState() => _UserManagementScreenState();
+}
+
+class _UserManagementScreenState extends State<UserManagementScreen> {
+  late Future<Map<String, dynamic>> _future;
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  void _load() =>
+      _future = context.read<AuthState>().api.get('usuarios?pageSize=100');
+
+  Future<void> _create() async {
+    final saved = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute<bool>(builder: (_) => const UserCreateScreen()),
+    );
+    if (saved == true && mounted) setState(_load);
+  }
+
+  Future<void> _edit(Map<String, dynamic> user) async {
+    final saved = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute<bool>(builder: (_) => UserEditScreen(user: user)),
+    );
+    if (saved == true && mounted) setState(_load);
+  }
+
+  Future<void> _delete(Map<String, dynamic> user) async {
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Excluir conta permanentemente?'),
+        content: Text(
+          'A conta de ${user['displayName']} será removida. Se houver movimentações ou comunicados vinculados, o servidor impedirá a exclusão para preservar o histórico.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Excluir'),
+          ),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+    try {
+      await context.read<AuthState>().api.delete('usuarios/${user['id']}');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Conta excluída.')));
+      setState(_load);
+    } on Object catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              error is ApiException
+                  ? error.message
+                  : 'Não foi possível excluir a conta.',
+            ),
+          ),
+        );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Usuários')),
+    floatingActionButton: FloatingActionButton.extended(
+      onPressed: _create,
+      icon: const Icon(Icons.person_add_alt_1),
+      label: const Text('Novo usuário'),
+    ),
+    body: FutureBuilder<Map<String, dynamic>>(
+      future: _future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting)
+          return const Center(child: CircularProgressIndicator());
+        if (snapshot.hasError)
+          return ErrorPanel(
+            error: snapshot.error!,
+            onRetry: () => setState(_load),
+          );
+        final rows = (snapshot.data?['items'] as List<dynamic>? ?? [])
+            .cast<Map<String, dynamic>>();
+        return RefreshIndicator(
+          onRefresh: () async {
+            setState(_load);
+            await _future;
+          },
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 90),
+            children: [
+              const Text(
+                'Funcionário consulta estoque, registra movimentações e acompanha comunicados. Administrador também gerencia cadastros, usuários e relatórios.',
+              ),
+              const SizedBox(height: 12),
+              if (rows.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Center(child: Text('Nenhum usuário encontrado.')),
+                ),
+              ...rows.map((user) {
+                final roles = (user['roles'] as List<dynamic>? ?? []).join(
+                  ', ',
+                );
+                final self =
+                    user['id']?.toString() == context.read<AuthState>().userId;
+                return Card(
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      child: Icon(
+                        user['isActive'] == true
+                            ? Icons.person_outline
+                            : Icons.person_off_outlined,
+                      ),
+                    ),
+                    title: Text('${user['displayName']}'),
+                    subtitle: Text(
+                      '${user['email']} - $roles - ${user['isActive'] == true ? 'Ativo' : 'Inativo'}',
+                    ),
+                    trailing: PopupMenuButton<String>(
+                      tooltip: 'Ações do usuário',
+                      onSelected: (action) {
+                        if (action == 'edit') _edit(user);
+                        if (action == 'delete') _delete(user);
+                      },
+                      itemBuilder: (_) => [
+                        const PopupMenuItem(
+                          value: 'edit',
+                          child: Text('Editar / ativar / desativar'),
+                        ),
+                        if (!self)
+                          const PopupMenuItem(
+                            value: 'delete',
+                            child: Text('Excluir conta'),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+            ],
+          ),
+        );
+      },
+    ),
+  );
+}
+
+class UserCreateScreen extends StatefulWidget {
+  const UserCreateScreen({super.key});
+  @override
+  State<UserCreateScreen> createState() => _UserCreateScreenState();
+}
+
+class _UserCreateScreenState extends State<UserCreateScreen> {
+  final _form = GlobalKey<FormState>();
+  final _name = TextEditingController();
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+  String _role = 'Funcionário';
+  bool _busy = false;
+  String? _error;
+  @override
+  void dispose() {
+    _name.dispose();
+    _email.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (!_form.currentState!.validate()) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await context.read<AuthState>().api.post('usuarios', {
+        'displayName': _name.text.trim(),
+        'email': _email.text.trim(),
+        'password': _password.text,
+        'role': _role,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } on Object catch (error) {
+      if (mounted)
+        setState(
+          () => _error = error is ApiException
+              ? error.message
+              : 'Não foi possível criar o usuário.',
+        );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Novo usuário')),
+    body: Form(
+      key: _form,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextFormField(
+            controller: _name,
+            maxLength: 120,
+            decoration: const InputDecoration(labelText: 'Nome'),
+            validator: (v) =>
+                v == null || v.trim().isEmpty ? 'Informe o nome.' : null,
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _email,
+            keyboardType: TextInputType.emailAddress,
+            autocorrect: false,
+            decoration: const InputDecoration(labelText: 'E-mail'),
+            validator: (v) => v == null || !v.contains('@')
+                ? 'Informe um e-mail válido.'
+                : null,
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _password,
+            obscureText: true,
+            enableSuggestions: false,
+            autocorrect: false,
+            decoration: const InputDecoration(
+              labelText: 'Senha inicial',
+              helperText:
+                  'Mínimo de 8 caracteres; não exige maiúsculas, números ou símbolos.',
+            ),
+            validator: (v) => v == null || v.length < 8
+                ? 'Use pelo menos 8 caracteres.'
+                : null,
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            initialValue: _role,
+            decoration: const InputDecoration(labelText: 'Perfil'),
+            items: const [
+              DropdownMenuItem(
+                value: 'Funcionário',
+                child: Text('Funcionário - usuário comum'),
+              ),
+              DropdownMenuItem(
+                value: 'Administrador',
+                child: Text('Administrador'),
+              ),
+            ],
+            onChanged: (value) =>
+                setState(() => _role = value ?? 'Funcionário'),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Funcionário consulta estoque, registra movimentações e lê comunicados. Administrador também gerencia cadastros, usuários e relatórios.',
+          ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          const SizedBox(height: 20),
+          FilledButton(
+            onPressed: _busy ? null : _save,
+            child: _busy
+                ? const CircularProgressIndicator()
+                : const Text('Criar usuário'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class UserEditScreen extends StatefulWidget {
+  const UserEditScreen({required this.user, super.key});
+  final Map<String, dynamic> user;
+  @override
+  State<UserEditScreen> createState() => _UserEditScreenState();
+}
+
+class _UserEditScreenState extends State<UserEditScreen> {
+  late final TextEditingController _name;
+  late final TextEditingController _email;
+  late String _role;
+  late bool _active;
+  bool _busy = false;
+  String? _error;
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: '${widget.user['displayName'] ?? ''}');
+    _email = TextEditingController(text: '${widget.user['email'] ?? ''}');
+    final roles = widget.user['roles'] as List<dynamic>? ?? [];
+    _role = roles.isNotEmpty ? roles.first.toString() : 'Funcionário';
+    _active = widget.user['isActive'] == true;
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _email.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (_name.text.trim().isEmpty || !_email.text.contains('@')) {
+      setState(() => _error = 'Confira o nome e o e-mail.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await context.read<AuthState>().api.put('usuarios/${widget.user['id']}', {
+        'displayName': _name.text.trim(),
+        'email': _email.text.trim(),
+        'isActive': _active,
+        'role': _role,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } on Object catch (error) {
+      if (mounted)
+        setState(
+          () => _error = error is ApiException
+              ? error.message
+              : 'Não foi possível atualizar o usuário.',
+        );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final self =
+        widget.user['id']?.toString() == context.read<AuthState>().userId;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Editar usuário')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextField(
+            controller: _name,
+            maxLength: 120,
+            decoration: const InputDecoration(labelText: 'Nome'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _email,
+            keyboardType: TextInputType.emailAddress,
+            decoration: const InputDecoration(labelText: 'E-mail'),
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            initialValue: _role,
+            decoration: const InputDecoration(labelText: 'Perfil'),
+            items: const [
+              DropdownMenuItem(
+                value: 'Funcionário',
+                child: Text('Funcionário - usuário comum'),
+              ),
+              DropdownMenuItem(
+                value: 'Administrador',
+                child: Text('Administrador'),
+              ),
+            ],
+            onChanged: self
+                ? null
+                : (value) => setState(() => _role = value ?? 'Funcionário'),
+          ),
+          SwitchListTile(
+            title: const Text('Conta ativa'),
+            subtitle: const Text(
+              'Desativar bloqueia o acesso sem apagar a conta.',
+            ),
+            value: _active,
+            onChanged: self ? null : (value) => setState(() => _active = value),
+          ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: _busy ? null : _save,
+            child: _busy
+                ? const CircularProgressIndicator()
+                : const Text('Salvar alterações'),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class MetricCard extends StatelessWidget {
